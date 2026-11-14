@@ -78,13 +78,29 @@ class usb_class(DeviceClass):
         if sys.platform.startswith('freebsd') or sys.platform.startswith('linux') or sys.platform.startswith('darwin'):
             self.backend = usb.backend.libusb1.get_backend(find_library=lambda x: "libusb-1.0.so")
         elif is_windows():
-            self.backend = None
-        if self.backend is not None:
+            # Prefer libusb0 when the 9008 device uses the libusb-win32 driver (Zadig).
+            # Fall back to bundled libusb-1.0 (WinUSB) if libusb0 is unavailable.
+            scripts_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "../..", "Windows")
+            venv_scripts = os.path.join(sys.prefix, "Scripts")
+            for d in (venv_scripts, scripts_dir):
+                try:
+                    os.add_dll_directory(os.path.abspath(d))
+                except Exception:
+                    pass
+                os.environ["PATH"] = os.path.abspath(d) + os.pathsep + os.environ.get("PATH", "")
+            self.backend = usb.backend.libusb0.get_backend()
+            if self.backend is None:
+                self.backend = usb.backend.libusb1.get_backend(
+                    find_library=lambda x: os.path.join(os.path.abspath(scripts_dir), "libusb-1.0.dll")
+                )
+        # libusb_set_option exists only on libusb1; never clear backend on failure
+        # (clearing forced pyusb onto libusb1 against libusb-win32 and crashed).
+        if self.backend is not None and self.backend.__class__.__module__.endswith("libusb1"):
             try:
                 self.backend.lib.libusb_set_option.argtypes = [c_void_p, c_int]
                 self.backend.lib.libusb_set_option(self.backend.ctx, 1)
-            except:
-                self.backend = None
+            except Exception:
+                pass
 
     def load_windows_dll(self):
         if os.name == 'nt':
@@ -388,6 +404,11 @@ class usb_class(DeviceClass):
         buffer = self.buffer[:resplen]
         epr = self.EP_IN.read
         extend = res.extend
+        # Retry count must be independent of the timeout value in ms.
+        # Sahara uses timeout=1000; the old "timeout == 10" exit never fired
+        # and hung forever on "Device detected".
+        timeout_retries = 0
+        max_timeout_retries = 10
         while len(res) < resplen:
             try:
                 resplen = epr(buffer, timeout)
@@ -395,16 +416,17 @@ class usb_class(DeviceClass):
                 if resplen == self.EP_IN.wMaxPacketSize:
                     break
             except usb.core.USBError as e:
-                error = str(e.strerror)
-                if "timed out" in error:
+                error = str(e.strerror).lower() if e.strerror else str(e).lower()
+                # libusb1: "timed out"; libusb0-win32: "timeout error"
+                if "timed out" in error or "timeout" in error:
                     if timeout is None:
                         return b""
                     self.debug("Timed out")
-                    if timeout == 10:
+                    timeout_retries += 1
+                    if timeout_retries >= max_timeout_retries:
                         return b""
-                    timeout += 1
                     pass
-                elif "Overflow" in error:
+                elif "Overflow" in error or "overflow" in error:
                     self.error("USB Overflow")
                     return b""
                 else:
